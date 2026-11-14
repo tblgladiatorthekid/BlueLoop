@@ -1,0 +1,308 @@
+// BlueLoop / BlueBank data model
+// See BlueLoop_PRD_and_Architecture.md Section 6 for the narrative version of this schema.
+// Money-shaped fields use Decimal, never Float, to avoid rounding drift in the reward ledger.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  PARTICIPANT
+  OPERATOR
+  RECYCLER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING
+}
+
+enum CollectionStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  CANCELLED
+}
+
+enum TransactionStatus {
+  COMPLETED
+  REVERSED
+}
+
+enum TransferStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+enum OrgType {
+  RECYCLING_PARTNER
+  SPONSOR
+}
+
+model User {
+  id           String     @id @default(cuid())
+  name         String
+  phone        String     @unique
+  email        String?    @unique
+  passwordHash String
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now())
+
+  operatorLinks       CollectionPointOperator[]
+  organizationLinks   OrganizationMember[]
+  collectionsMade     Collection[]        @relation("ParticipantCollections")
+  collectionsVerified Collection[]        @relation("OperatorCollections")
+  rewardTransactions  RewardTransaction[]
+  balance             ParticipantBalance?
+  auditLogs           AuditLog[]
+
+  @@index([role])
+}
+
+model Location {
+  id        String @id @default(cuid())
+  name      String
+  region    String
+  country   String @default("Nigeria")
+  latitude  Float
+  longitude Float
+  status    String @default("ACTIVE")
+
+  collectionPoints CollectionPoint[]
+  rewardRates      RewardRate[]
+  bonusCampaigns   BonusCampaign[]
+}
+
+model CollectionPoint {
+  id             String   @id @default(cuid())
+  locationId     String
+  location       Location @relation(fields: [locationId], references: [id])
+  name           String
+  latitude       Float
+  longitude      Float
+  address        String?
+  status         String   @default("PENDING") // PENDING | ACTIVE | SUSPENDED
+  operatingHours String?
+  createdAt      DateTime @default(now())
+
+  operators         CollectionPointOperator[]
+  acceptedMaterials CollectionPointMaterial[]
+  collections       Collection[]
+  transfersOut      MaterialTransfer[]
+}
+
+model CollectionPointOperator {
+  id                String          @id @default(cuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id])
+  collectionPointId String
+  collectionPoint   CollectionPoint @relation(fields: [collectionPointId], references: [id])
+  status            String          @default("ACTIVE")
+
+  @@unique([userId, collectionPointId])
+}
+
+model Organization {
+  id          String  @id @default(cuid())
+  name        String
+  type        OrgType
+  contactInfo String?
+  status      String  @default("PENDING")
+  isPlaceholder Boolean @default(false) // true for demo/placeholder partners — must be surfaced in UI
+
+  acceptedMaterials OrgAcceptedMaterial[]
+  transfersIn       MaterialTransfer[]
+  members           OrganizationMember[]
+}
+
+// Scopes a RECYCLER-role user to a specific organization, mirroring
+// CollectionPointOperator. Without this, any authenticated RECYCLER user
+// could confirm any org's transfers — fine for a single placeholder
+// partner, wrong the moment a second partner joins.
+model OrganizationMember {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id])
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  status         String       @default("ACTIVE")
+
+  @@unique([userId, organizationId])
+}
+
+model WasteCategory {
+  id           String  @id @default(cuid())
+  name         String
+  code         String  @unique
+  isRecyclable Boolean @default(true)
+  active       Boolean @default(true)
+
+  collectionPointLinks CollectionPointMaterial[]
+  orgLinks             OrgAcceptedMaterial[]
+  rewardRates          RewardRate[]
+  collections          Collection[]
+  bonusCampaigns       BonusCampaign[]
+  transfers            MaterialTransfer[]
+}
+
+model CollectionPointMaterial {
+  collectionPointId String
+  collectionPoint   CollectionPoint @relation(fields: [collectionPointId], references: [id])
+  wasteCategoryId   String
+  wasteCategory     WasteCategory   @relation(fields: [wasteCategoryId], references: [id])
+
+  @@id([collectionPointId, wasteCategoryId])
+}
+
+model OrgAcceptedMaterial {
+  organizationId  String
+  organization    Organization  @relation(fields: [organizationId], references: [id])
+  wasteCategoryId String
+  wasteCategory   WasteCategory @relation(fields: [wasteCategoryId], references: [id])
+
+  @@id([organizationId, wasteCategoryId])
+}
+
+// Versioned, admin-configurable reward rate. Rows are never overwritten —
+// changing a rate means closing the old row (effectiveTo) and opening a new one.
+model RewardRate {
+  id              String    @id @default(cuid())
+  wasteCategoryId String
+  wasteCategory   WasteCategory @relation(fields: [wasteCategoryId], references: [id])
+  locationId      String?
+  location        Location? @relation(fields: [locationId], references: [id])
+  ratePerKgBbc    Decimal   @db.Decimal(10, 4)
+  effectiveFrom   DateTime  @default(now())
+  effectiveTo     DateTime?
+  createdBy       String
+  sourceNote      String?   // provenance, e.g. "Lagos PET collector rate ~NGN90/kg, reported Dec 2023 — UNVERIFIED for HDPE"
+
+  @@index([wasteCategoryId, locationId, effectiveFrom])
+}
+
+// Versioned BBC -> NGN peg. Separate from RewardRate so the redemption rate
+// can move independently of collection economics, and so a participant's
+// historical earnings reflect the peg active when they were earned.
+model BbcConversionRate {
+  id            String    @id @default(cuid())
+  ngnPerBbc     Decimal   @db.Decimal(10, 4) // pilot default: 0.45
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  createdBy     String
+  note          String?
+
+  @@index([effectiveFrom])
+}
+
+model BonusCampaign {
+  id              String        @id @default(cuid())
+  name            String
+  wasteCategoryId String?
+  wasteCategory   WasteCategory? @relation(fields: [wasteCategoryId], references: [id])
+  locationId      String?
+  location        Location?     @relation(fields: [locationId], references: [id])
+  bonusType       String        // "MULTIPLIER" | "FLAT_BBC"
+  value           Decimal       @db.Decimal(10, 4)
+  startDate       DateTime
+  endDate         DateTime
+  active          Boolean       @default(true)
+}
+
+model Collection {
+  id                String            @id @default(cuid())
+  idempotencyKey    String            @unique
+  participantId     String
+  participant       User              @relation("ParticipantCollections", fields: [participantId], references: [id])
+  collectionPointId String
+  collectionPoint   CollectionPoint   @relation(fields: [collectionPointId], references: [id])
+  wasteCategoryId   String
+  wasteCategory     WasteCategory     @relation(fields: [wasteCategoryId], references: [id])
+  submittedWeightKg Decimal           @db.Decimal(8, 3)
+  verifiedWeightKg  Decimal?          @db.Decimal(8, 3)
+  status            CollectionStatus  @default(PENDING)
+  operatorId        String?
+  operator          User?             @relation("OperatorCollections", fields: [operatorId], references: [id])
+  evidenceUrl       String?
+  latitude          Float?
+  longitude         Float?
+  notes             String?
+  createdAt         DateTime          @default(now())
+  verifiedAt        DateTime?
+
+  // Anomaly flag for admin/operator review (PRD §18). A flag never blocks a
+  // submission or a reward on its own; it only surfaces it for a human.
+  flagged           Boolean           @default(false)
+  flagReason        String?
+
+  rewardTransaction RewardTransaction?
+
+  @@index([participantId])
+  @@index([collectionPointId, status])
+  @@index([flagged, status])
+}
+
+// Append-only ledger. Never update amountBbc or delete a row after creation —
+// corrections happen via reverseRewardTransaction(), which writes a new
+// compensating record and leaves this one intact.
+model RewardTransaction {
+  id             String             @id @default(cuid())
+  collectionId   String             @unique
+  collection     Collection         @relation(fields: [collectionId], references: [id])
+  participantId  String
+  participant    User               @relation(fields: [participantId], references: [id])
+  amountBbc      Decimal            @db.Decimal(10, 4)
+  ngnPegAtCreate Decimal            @db.Decimal(10, 4) // BBC->NGN peg active when this was created
+  status         TransactionStatus  @default(COMPLETED)
+  createdAt      DateTime           @default(now())
+  reversedAt     DateTime?
+  reversedBy     String?
+  reversalReason String?
+
+  @@index([participantId, status])
+}
+
+model ParticipantBalance {
+  participantId String   @id
+  participant   User     @relation(fields: [participantId], references: [id])
+  balanceBbc    Decimal  @default(0) @db.Decimal(10, 4)
+  updatedAt     DateTime @updatedAt
+}
+
+model MaterialTransfer {
+  id                String          @id @default(cuid())
+  collectionPointId String
+  collectionPoint   CollectionPoint @relation(fields: [collectionPointId], references: [id])
+  organizationId    String
+  organization      Organization    @relation(fields: [organizationId], references: [id])
+  wasteCategoryId   String
+  wasteCategory     WasteCategory   @relation(fields: [wasteCategoryId], references: [id])
+  weightKg          Decimal         @db.Decimal(8, 3)
+  status            TransferStatus  @default(PENDING)
+  transferredAt     DateTime        @default(now())
+  confirmedAt       DateTime?
+  confirmedBy       String?
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorId     String?
+  actor       User?    @relation(fields: [actorId], references: [id])
+  action      String
+  entityType  String
+  entityId    String
+  beforeState Json?
+  afterState  Json?
+  timestamp   DateTime @default(now())
+  ipAddress   String?
+
+  @@index([entityType, entityId])
+}
